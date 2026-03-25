@@ -1,6 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
+import rateLimit from "express-rate-limit";
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -11,14 +12,39 @@ if (!LLM_KEY) {
     process.exit(1);
 }
 
-app.use(cors({ origin: ["http://localhost:8080", "http://localhost:3000", "http://127.0.0.1:8080"] }));
+const allowedOrigins = [
+    "http://localhost:8080",
+    "http://localhost:3000",
+    "http://127.0.0.1:8080",
+    "https://dream-wealth-ai.lovable.app",
+];
+
+app.use(
+    cors({
+        origin: function (origin, callback) {
+            if (!origin || allowedOrigins.includes(origin)) {
+                callback(null, true);
+            } else {
+                callback(new Error("CORS blocked: " + origin));
+            }
+        },
+        methods: ["GET", "POST", "OPTIONS"],
+        allowedHeaders: ["Content-Type"],
+    })
+);
+
+const limiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 min
+    max: 20, // limit each IP
+});
+
+app.use("/api/", limiter);
 app.use(express.json());
 
 // ─── POST /api/insights ──────────────────────────────────────────────────────
 // Body: { data: FinancialData, metrics: FinancialMetrics }
 // Returns: { sections: InsightSection[] }
 app.post("/api/insights", async (req, res) => {
-    console.log("Received /api/insights request:", JSON.stringify(req.body, null, 2));
     const { data, metrics } = req.body;
 
     if (!data || !metrics) {
