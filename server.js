@@ -3,14 +3,21 @@ import express from "express";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
 
+import { createClient } from "@supabase/supabase-js";
+
 const app = express();
 const PORT = process.env.PORT || 3001;
 const LLM_KEY = process.env.LLM_KEY;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-if (!LLM_KEY) {
-    console.error("❌ LLM_KEY is not set in .env — please add your Gemini API key.");
+if (!LLM_KEY || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+    console.error("❌ Missing required environment variables (LLM_KEY, SUPABASE_URL, or SUPABASE_SERVICE_ROLE_KEY)");
     process.exit(1);
 }
+
+// Initialize Supabase admin client (using service role to manage quotas)
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 const allowedOrigins = [
     "http://localhost:8080",
@@ -29,39 +36,91 @@ app.use(
             }
         },
         methods: ["GET", "POST", "OPTIONS"],
-        allowedHeaders: ["Content-Type"],
+        allowedHeaders: ["Content-Type", "Authorization"],
     })
 );
 
-const limiter = rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 min
-    max: 20, // limit each IP
+// ─── AUTH MIDDLEWARE ────────────────────────────────────────────────────────
+const authenticateUser = async (req, res, next) => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+        return res.status(401).json({ error: "Missing or invalid authorization header" });
+    }
+
+    const token = authHeader.split(" ")[1];
+    try {
+        const { data: { user }, error } = await supabase.auth.getUser(token);
+        if (error || !user) {
+            return res.status(401).json({ error: "Invalid or expired token" });
+        }
+        req.user = user;
+        next();
+    } catch (err) {
+        return res.status(401).json({ error: "Authentication failed" });
+    }
+};
+
+// ─── QUOTA & CACHE HELPERS ────────────────────────────────────────────────────
+const verifyRateLimit = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 10, // strict limit on proxy requests
 });
 
-app.use("/api/", limiter);
+app.use("/api/", verifyRateLimit);
 app.use(express.json());
 
 // ─── POST /api/insights ──────────────────────────────────────────────────────
-// Body: { data: FinancialData, metrics: FinancialMetrics }
-// Returns: { sections: InsightSection[] }
-app.post("/api/insights", async (req, res) => {
-    const { data, metrics } = req.body;
+app.post("/api/insights", authenticateUser, async (req, res) => {
+    const { data, metrics, dataHash } = req.body;
+    const userId = req.user.id;
 
-    if (!data || !metrics) {
-        return res.status(400).json({ error: "Missing data or metrics in request body" });
+    if (!data || !metrics || !dataHash) {
+        return res.status(400).json({ error: "Missing data, metrics, or dataHash in request body" });
     }
 
-    const fmt = (n) =>
-        new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 0 }).format(n);
+    try {
+        // 1. Check Supabase Cache FIRST (zero quota/LLM cost)
+        const { data: cached, error: cacheError } = await supabase
+            .from("ai_insights_cache")
+            .select("insight_data")
+            .eq("user_id", userId)
+            .eq("data_hash", dataHash)
+            .single();
 
-    const prompt = `
+        if (cached && !cacheError) {
+            console.log("Supabase cache hit in backend for:", userId);
+            return res.json({ ...cached.insight_data, cached: true });
+        }
+
+        // 2. Atomic Quota Check & Increment via RPC
+        const { data: isAllowed, error: rpcError } = await supabase.rpc(
+            "check_and_increment_quota",
+            { target_user_id: userId }
+        );
+
+        if (rpcError) {
+            console.error("Quota RPC error:", rpcError);
+            return res.status(500).json({ error: "Failed to verify quota" });
+        }
+
+        if (!isAllowed) {
+            return res.status(429).json({
+                error: "Daily quota reached",
+                message: "You have used your daily insights quota. Please upgrade or try again tomorrow.",
+            });
+        }
+
+        const fmt = (n) =>
+            new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 0 }).format(n);
+
+        const prompt = `
 You are a brutally honest Indian financial advisor. No sugarcoating. Speak directly to the user.
 
 The user's financial data:
 - Monthly Income: ${fmt(data.monthlyIncome)}
 - Monthly Expenses: ${fmt(metrics.totalExpenses)} (housing: ${fmt(data.expenses.housing)}, food: ${fmt(data.expenses.food)}, transport: ${fmt(data.expenses.transportation)}, utilities: ${fmt(data.expenses.utilities)}, insurance: ${fmt(data.expenses.insurance)}, entertainment: ${fmt(data.expenses.entertainment)}, healthcare: ${fmt(data.expenses.healthcare)}, education: ${fmt(data.expenses.education)}, other: ${fmt(data.expenses.other)})
 - Assets: Bank Balance ${fmt(data.assets.bankBalance)}, Gold ${fmt(data.assets.gold)}, Mutual Funds ${fmt(data.assets.mutualFunds)}, Stocks ${fmt(data.assets.stocks)}, Real Estate ${fmt(data.assets.realEstate)}
-- Liabilities: Home Loan ${fmt(data.liabilities.homeLoan)}, Personal Loan ${fmt(data.liabilities.personalLoan)}, Credit Card Debt ${fmt(data.liabilities.creditCardDebt)}, Other EMIs ${fmt(data.liabilities.otherEMIs)}
+- Liabilities: Home Loan ${fmt(data.liabilities.homeLoan)}, Personal Loan ${fmt(data.liabilities.personalLoan)}, Credit Card Debt ${fmt(data.liabilities.creditCardDebt)}, Other EMIs ${fmt(data.liabilities.others)}
 - Risk Appetite: ${data.riskAppetite}
 
 Calculated metrics:
@@ -110,7 +169,6 @@ Return ONLY a valid JSON object with this exact structure (no markdown, no expla
 Be specific — reference actual numbers from the data. Keep each item under 120 characters. No generic advice.
 `;
 
-    try {
         const geminiRes = await fetch(
             `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${LLM_KEY}`,
             {
@@ -141,11 +199,22 @@ Be specific — reference actual numbers from the data. Keep each item under 120
 
         // Parse and validate JSON
         const parsed = JSON.parse(rawText);
-        if (!parsed.sections || !Array.isArray(parsed.sections)) {
-            return res.status(502).json({ error: "Unexpected response shape from Gemini" });
+
+        const finalPayload = { ...parsed, timestamp: Date.now() };
+
+        // 3. Save to Supabase Cache via Backend
+        const { error: insertError } = await supabase.from("ai_insights_cache").upsert({
+            user_id: userId,
+            data_hash: dataHash,
+            insight_data: finalPayload,
+            created_at: new Date().toISOString()
+        });
+
+        if (insertError) {
+            console.error("Failed to save insights to Supabase cache", insertError);
         }
 
-        return res.json({ ...parsed, timestamp: Date.now() });
+        return res.json(finalPayload);
     } catch (err) {
         console.error("Server error:", err);
         return res.status(500).json({ error: "Internal server error", detail: err.message });
