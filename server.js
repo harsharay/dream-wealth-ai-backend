@@ -2,22 +2,41 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
-
 import { createClient } from "@supabase/supabase-js";
+import { z } from "zod";
+import crypto from "crypto";
 
+// --- CONFIG & ENV ---
 const app = express();
 const PORT = process.env.PORT || 3001;
 const LLM_KEY = process.env.LLM_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
 
-if (!LLM_KEY || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-    console.error("❌ Missing required environment variables (LLM_KEY, SUPABASE_URL, or SUPABASE_SERVICE_ROLE_KEY)");
+// Structured Logger
+const logger = {
+    info: (event, data = {}) => console.log(JSON.stringify({ timestamp: new Date().toISOString(), level: "info", event, ...data })),
+    error: (event, error, data = {}) => console.error(JSON.stringify({ timestamp: new Date().toISOString(), level: "error", event, error: error?.message || error, ...data })),
+    warn: (event, data = {}) => console.warn(JSON.stringify({ timestamp: new Date().toISOString(), level: "warn", event, ...data })),
+};
+
+logger.info("startup_init", { message: "Starting WealthPilot backend..." });
+
+if (!LLM_KEY || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !ENCRYPTION_KEY) {
+    logger.error("startup_error", "Missing required environment variables (LLM_KEY, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, ENCRYPTION_KEY)");
     process.exit(1);
 }
 
-// Initialize Supabase admin client (using service role to manage quotas)
+if (Buffer.from(ENCRYPTION_KEY, 'hex').length !== 32) {
+    logger.error("startup_error", "ENCRYPTION_KEY must be a 64-character hex string (32 bytes).");
+    process.exit(1);
+}
+
+// Subsystems
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+const PROMPT_VERSION = "1.1";
+const MODEL_VERSION = "gemini-2.0-flash";
 
 const allowedOrigins = [
     "http://localhost:8080",
@@ -26,206 +45,565 @@ const allowedOrigins = [
     "https://dream-wealth-ai.lovable.app",
 ];
 
-app.use(
-    cors({
-        origin: function (origin, callback) {
-            if (!origin || allowedOrigins.includes(origin)) {
-                callback(null, true);
-            } else {
-                callback(new Error("CORS blocked: " + origin));
-            }
-        },
-        methods: ["GET", "POST", "OPTIONS"],
-        allowedHeaders: ["Content-Type", "Authorization"],
-    })
-);
+app.use(cors({
+    origin: (origin, callback) => {
+        if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+        callback(new Error("CORS blocked: " + origin));
+    },
+    methods: ["GET", "POST", "PUT", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+}));
 
-// ─── AUTH MIDDLEWARE ────────────────────────────────────────────────────────
+// Payload Size Limitation (Cost & Memory Control)
+app.use(express.json({ limit: "10kb" }));
+
+// --- MIDDLEWARES ---
+
 const authenticateUser = async (req, res, next) => {
     const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    if (!authHeader?.startsWith("Bearer ")) {
         return res.status(401).json({ error: "Missing or invalid authorization header" });
     }
-
     const token = authHeader.split(" ")[1];
     try {
         const { data: { user }, error } = await supabase.auth.getUser(token);
-        if (error || !user) {
-            return res.status(401).json({ error: "Invalid or expired token" });
-        }
+        if (error || !user) return res.status(401).json({ error: "Invalid or expired token" });
         req.user = user;
         next();
     } catch (err) {
+        logger.error("auth_failure", err);
         return res.status(401).json({ error: "Authentication failed" });
     }
 };
 
-// ─── QUOTA & CACHE HELPERS ────────────────────────────────────────────────────
 const verifyRateLimit = rateLimit({
     windowMs: 15 * 60 * 1000,
-    max: 10, // strict limit on proxy requests
+    max: 100, // Global proxy rate per user to prevent API flood. Business quotas are in DB.
+    keyGenerator: (req) => req.user?.id || req.ip,
+    handler: (req, res) => res.status(429).json({ error: "Too many proxy requests" })
 });
-
 app.use("/api/", verifyRateLimit);
-app.use(express.json());
 
-// ─── POST /api/insights ──────────────────────────────────────────────────────
-app.post("/api/insights", authenticateUser, async (req, res) => {
-    const { data, metrics, dataHash } = req.body;
-    const userId = req.user.id;
+// --- SCHEMAS (ZOD) ---
 
-    if (!data || !metrics || !dataHash) {
-        return res.status(400).json({ error: "Missing data, metrics, or dataHash in request body" });
+const financialDataSchema = z.object({
+    monthlyIncome: z.number().min(0).max(100000000),
+    expenses: z.record(z.number().min(0)),
+    assets: z.record(z.number().min(0)),
+    liabilities: z.record(z.number().min(0)),
+    riskAppetite: z.enum(["low", "medium", "high"])
+}).strict();
+
+const insightsRequestSchema = z.object({
+    data: financialDataSchema,
+    metrics: z.record(z.any()), // Metrics are generated by frontend, passed down
+    dataHash: z.string().min(1)
+}).strict();
+
+
+// --- HELPERS ---
+
+const encryptData = (dataObj) => {
+    const iv = crypto.randomBytes(16);
+    const cipher = crypto.createCipheriv("aes-256-cbc", Buffer.from(ENCRYPTION_KEY, 'hex'), iv);
+    let encrypted = cipher.update(JSON.stringify(dataObj), "utf8", "hex");
+    encrypted += cipher.final("hex");
+    return `${iv.toString('hex')}:${encrypted}`;
+};
+
+const decryptData = (encryptedStr) => {
+    const [ivHex, encryptedHex] = encryptedStr.split(':');
+    const iv = Buffer.from(ivHex, 'hex');
+    const decipher = crypto.createDecipheriv("aes-256-cbc", Buffer.from(ENCRYPTION_KEY, 'hex'), iv);
+    let decrypted = decipher.update(encryptedHex, "hex", "utf8");
+    decrypted += decipher.final("utf8");
+    return JSON.parse(decrypted);
+};
+
+const callGemini = async (prompt) => {
+    const t0 = Date.now();
+    const geminiRes = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${MODEL_VERSION}:generateContent?key=${LLM_KEY}`,
+        {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                contents: [{ parts: [{ text: prompt }] }],
+                generationConfig: { temperature: 0.7, responseMimeType: "application/json" },
+            }),
+        }
+    );
+
+    if (!geminiRes.ok) {
+        const errText = await geminiRes.text();
+        throw new Error(`Gemini API error: ${geminiRes.status} - ${errText}`);
     }
 
+    const geminiData = await geminiRes.json();
+    const duration = Date.now() - t0;
+    const rawText = geminiData.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!rawText) throw new Error("Empty response from Gemini");
+
+    logger.info("llm_response", { duration_ms: duration, tokens: rawText.length });
+    return JSON.parse(rawText);
+};
+
+// --- ROUTES ---
+
+// 1. FINANCIAL RECORDS: Save & Fetch (Encrypted)
+app.post("/api/financial-records", authenticateUser, async (req, res) => {
     try {
-        // 1. Check Supabase Cache FIRST (zero quota/LLM cost)
+        const validatedArgs = financialDataSchema.parse(req.body);
+        const encryptedPayload = encryptData(validatedArgs);
+        
+        const { error } = await supabase.from("financial_records").upsert({
+            user_id: req.user.id,
+            encrypted_payload: encryptedPayload,
+            updated_at: new Date().toISOString()
+        }, { onConflict: 'user_id' }); // Assuming user_id is PK or pseudo-PK usually
+
+        if (error) throw error;
+        logger.info("financial_records_saved", { user_id: req.user.id });
+        res.json({ success: true });
+    } catch (err) {
+        logger.error("financial_records_error", err, { user_id: req.user.id });
+        res.status(400).json({ error: err.issues || err.message });
+    }
+});
+
+app.get("/api/financial-records", authenticateUser, async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from("financial_records")
+            .select("encrypted_payload")
+            .eq("user_id", req.user.id)
+            .order("updated_at", { ascending: false })
+            .limit(1)
+            .single();
+
+        if (error && error.code !== "PGRST116") throw error; // PGRST116 is 'not found'
+        if (!data) return res.json(null);
+
+        const decrypted = decryptData(data.encrypted_payload);
+        res.json(decrypted);
+    } catch (err) {
+        logger.error("financial_records_fetch_error", err, { user_id: req.user.id });
+        res.status(500).json({ error: "Failed to retrieve financial records" });
+    }
+});
+
+
+// 2. INSIGHTS
+app.post("/api/insights", authenticateUser, async (req, res) => {
+    const t0 = Date.now();
+    const userId = req.user.id;
+    let validatedReq;
+
+    try {
+        validatedReq = insightsRequestSchema.parse(req.body);
+    } catch (err) {
+        logger.warn("validation_failed", { user_id: userId, issues: err.issues });
+        return res.status(400).json({ error: err.issues });
+    }
+
+    const { data, metrics, dataHash } = validatedReq;
+    const versionString = `${PROMPT_VERSION}|${MODEL_VERSION}`;
+    const backendHash = crypto.createHash('sha256').update(dataHash + versionString).digest('hex');
+
+    try {
+        // Cache Check
         const { data: cached, error: cacheError } = await supabase
             .from("ai_insights_cache")
             .select("insight_data")
             .eq("user_id", userId)
-            .eq("data_hash", dataHash)
+            .eq("data_hash", backendHash)
             .single();
 
         if (cached && !cacheError) {
-            console.log("Supabase cache hit in backend for:", userId);
+            logger.info("cache_hit", { user_id: userId, hash: backendHash, total_ms: Date.now() - t0 });
             return res.json({ ...cached.insight_data, cached: true });
         }
 
-        // 2. Atomic Quota Check & Increment via RPC
-        const { data: isAllowed, error: rpcError } = await supabase.rpc(
-            "check_and_increment_quota",
-            { target_user_id: userId }
-        );
-
-        if (rpcError) {
-            console.error("Quota RPC error:", rpcError);
-            return res.status(500).json({ error: "Failed to verify quota" });
-        }
-
+        // Quota Check
+        const { data: isAllowed, error: rpcError } = await supabase.rpc("check_and_increment_quota", { target_user_id: userId });
+        if (rpcError) throw rpcError;
+        
         if (!isAllowed) {
-            return res.status(429).json({
-                error: "Daily quota reached",
-                message: "You have used your daily insights quota. Please upgrade or try again tomorrow.",
-            });
+            logger.warn("quota_exceeded", { user_id: userId });
+            return res.status(429).json({ error: "Daily quota reached" });
         }
 
-        const fmt = (n) =>
-            new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 0 }).format(n);
+        const fmt = (n) => new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR", maximumFractionDigits: 0 }).format(n);
+        const prompt = `You are a brutally honest Indian financial advisor. Speak directly to the user.
+Features: Monthly Income: ${fmt(data.monthlyIncome)} | Expenses: ${fmt(metrics.totalExpenses)} | Net Worth: ${fmt(metrics.netWorth)} | Savings Rate: ${metrics.savingsRate}%
 
-        const prompt = `
-You are a brutally honest Indian financial advisor. No sugarcoating. Speak directly to the user.
-
-The user's financial data:
-- Monthly Income: ${fmt(data.monthlyIncome)}
-- Monthly Expenses: ${fmt(metrics.totalExpenses)} (housing: ${fmt(data.expenses.housing)}, food: ${fmt(data.expenses.food)}, transport: ${fmt(data.expenses.transportation)}, utilities: ${fmt(data.expenses.utilities)}, insurance: ${fmt(data.expenses.insurance)}, entertainment: ${fmt(data.expenses.entertainment)}, healthcare: ${fmt(data.expenses.healthcare)}, education: ${fmt(data.expenses.education)}, other: ${fmt(data.expenses.other)})
-- Assets: Bank Balance ${fmt(data.assets.bankBalance)}, Gold ${fmt(data.assets.gold)}, Mutual Funds ${fmt(data.assets.mutualFunds)}, Stocks ${fmt(data.assets.stocks)}, Real Estate ${fmt(data.assets.realEstate)}
-- Liabilities: Home Loan ${fmt(data.liabilities.homeLoan)}, Personal Loan ${fmt(data.liabilities.personalLoan)}, Credit Card Debt ${fmt(data.liabilities.creditCardDebt)}, Other EMIs ${fmt(data.liabilities.others)}
-- Risk Appetite: ${data.riskAppetite}
-
-Calculated metrics:
-- Health Score: ${metrics.healthScore}/100
-- Net Worth: ${fmt(metrics.netWorth)}
-- Savings Rate: ${metrics.savingsRate.toFixed(1)}%
-- Debt-to-Income Ratio: ${metrics.debtToIncomeRatio.toFixed(1)}%
-- Liquidity Ratio: ${metrics.liquidityRatio.toFixed(2)}
-- Asset Diversification Score: ${metrics.assetDiversificationScore.toFixed(0)}/100
-
-Return ONLY a valid JSON object with this exact structure (no markdown, no explanation):
+Return ONLY a valid JSON object matching exactly:
 {
   "sections": [
-    {
-      "title": "Diagnosis",
-      "emoji": "🩺",
-      "bullet": "→",
-      "bgColor": "bg-accent/20",
-      "items": ["<2-3 direct, personalized sentences about overall financial health>"]
-    },
-    {
-      "title": "Key Risks",
-      "emoji": "⚠️",
-      "bullet": "✕",
-      "bgColor": "bg-danger/10",
-      "items": ["<1-4 specific risks based on the data>"]
-    },
-    {
-      "title": "Missed Opportunities",
-      "emoji": "💡",
-      "bullet": "★",
-      "bgColor": "bg-secondary/30",
-      "items": ["<1-3 actionable missed opportunities>"]
-    },
-    {
-      "title": "Action Plan",
-      "emoji": "🎯",
-      "bullet": "→",
-      "bgColor": "bg-accent/10",
-      "items": ["<2-4 concrete numbered action items, most urgent first>"]
-    }
+    { "title": "Diagnosis", "emoji": "🩺", "bullet": "→", "bgColor": "bg-accent/20", "items": ["<2-3 direct sentences>"] },
+    { "title": "Key Risks", "emoji": "⚠️", "bullet": "✕", "bgColor": "bg-danger/10", "items": ["<1-4 risks>"] },
+    { "title": "Action Plan", "emoji": "🎯", "bullet": "→", "bgColor": "bg-accent/10", "items": ["<2-3 actions>"] }
   ],
-  "warnings": ["<0-5 short, punchy warning strings for the warnings panel, or empty array if none>"]
-}
+  "warnings": ["<0-3 short punchy warnings>"]
+}`;
 
-Be specific — reference actual numbers from the data. Keep each item under 120 characters. No generic advice.
-`;
+        const parsedOutput = await callGemini(prompt);
+        const finalPayload = { ...parsedOutput, timestamp: Date.now() };
 
-        const geminiRes = await fetch(
-            `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${LLM_KEY}`,
-            {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    contents: [{ parts: [{ text: prompt }] }],
-                    generationConfig: {
-                        temperature: 0.7,
-                        responseMimeType: "application/json",
-                    },
-                }),
-            }
-        );
-
-        if (!geminiRes.ok) {
-            const errText = await geminiRes.text();
-            console.error("Gemini API error:", geminiRes.status, errText);
-            return res.status(502).json({ error: "Gemini API error", detail: errText });
-        }
-
-        const geminiData = await geminiRes.json();
-        const rawText = geminiData.candidates?.[0]?.content?.parts?.[0]?.text;
-
-        if (!rawText) {
-            return res.status(502).json({ error: "Empty response from Gemini" });
-        }
-
-        // Parse and validate JSON
-        const parsed = JSON.parse(rawText);
-
-        const finalPayload = { ...parsed, timestamp: Date.now() };
-
-        // 3. Save to Supabase Cache via Backend
-        const { error: insertError } = await supabase.from("ai_insights_cache").upsert({
-            user_id: userId,
-            data_hash: dataHash,
-            insight_data: finalPayload,
-            created_at: new Date().toISOString()
+        await supabase.from("ai_insights_cache").upsert({
+            user_id: userId, data_hash: backendHash, insight_data: finalPayload, created_at: new Date().toISOString()
         });
 
-        if (insertError) {
-            console.error("Failed to save insights to Supabase cache", insertError);
-        }
-
-        return res.json(finalPayload);
+        logger.info("cache_miss_served", { user_id: userId, total_ms: Date.now() - t0 });
+        res.json(finalPayload);
     } catch (err) {
-        console.error("Server error:", err);
-        return res.status(500).json({ error: "Internal server error", detail: err.message });
+        logger.error("insights_error", err, { user_id: userId });
+        res.status(500).json({ error: "Internal server error" });
     }
 });
 
-// Health check
-app.get("/health", (_req, res) => res.json({ status: "ok", message: "WealthPilot backend is running 🚀" }));
+// INSIGHT HISTORY
+app.get("/api/insights/history", authenticateUser, async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from("ai_insights_cache")
+            .select("insight_data, created_at")
+            .eq("user_id", req.user.id)
+            .order("created_at", { ascending: false });
+
+        if (error) throw error;
+        res.json(data);
+    } catch (err) {
+        logger.error("history_fetch_error", err);
+        res.status(500).json({ error: "Failed to fetch history" });
+    }
+});
+
+// 3. SIMULATOR
+app.post("/api/simulator/questions", authenticateUser, async (req, res) => {
+    try {
+        const { data, metrics, force_refresh } = req.body;
+        const userId = req.user.id;
+        
+        // Cache Check
+        const dataHash = crypto.createHash('sha256').update(JSON.stringify({ metrics, riskAppetite: data?.riskAppetite })).digest('hex');
+        
+        if (!force_refresh) {
+            const { data: cached, error: cacheError } = await supabase
+                .from("simulator_question_cache")
+                .select("questions")
+                .eq("user_id", userId)
+                .eq("data_hash", dataHash)
+                .single();
+
+            if (cached && !cacheError) {
+                logger.info("simulator_cache_hit", { user_id: userId, hash: dataHash });
+                return res.json({ questions: cached.questions, cached: true });
+            }
+        }
+
+        if (force_refresh) {
+            // Re-verify eligibility on the backend when explicitly forcing a new generation
+            const { data: stateData } = await supabase.from("simulator_state").select("state_data").eq("user_id", userId).single();
+            const lastGen = stateData?.state_data?.lastGeneratedAt || 0;
+            const weekInMs = 7 * 24 * 3600 * 1000;
+            if (Date.now() - lastGen < weekInMs) {
+                return res.status(403).json({ error: "Cannot generate new suggestions before the 7-day cooldown period is over." });
+            }
+        }
+
+        const prompt = `You are a practical Indian finance coach helping users improve their financial life.
+
+        User data:
+        - Net worth: ${metrics?.netWorth}
+        - Savings rate: ${metrics?.savingsRate}%
+        - Risk appetite: ${data?.riskAppetite}
+
+        Context:
+        Consider Indian financial behavior — family responsibilities, job stability concerns, preference for gold/real estate, low insurance awareness, and irregular investing habits.
+        ${force_refresh ? "\n        CRITICAL INSTRUCTION: The user has directly requested NEW suggestions. You MUST generate entirely novel, different questions from standard ones. Approach their financial situation from a completely new angle (e.g., if you asked about emergency funds before, ask about retirement, passion projects, or parents' health insurance now)." : ""}
+
+        Task:
+        Generate 3 highly relevant, personalized questions that:
+        - Are crisp and easy to understand (max 12–15 words each)
+        - Focus on real-life triggers (marriage, parents, EMIs, job switch, etc.)
+        - Uncover hidden habits or missing financial planning
+        - Adapt to the user’s numbers (low/high savings, low/high net worth, etc.)
+        - Push the user to think (not generic advice)
+
+        Avoid:
+        - Long or complex sentences
+        - Generic textbook questions
+        - Obvious questions already answered by the data
+
+        Return ONLY JSON:
+        { "questions": ["Q1", "Q2", "Q3"] }`;
+        
+        const output = await callGemini(prompt);
+        
+        // Save to Cache
+        await supabase.from("simulator_question_cache").upsert({
+            user_id: userId, data_hash: dataHash, questions: output.questions, created_at: new Date().toISOString()
+        }, { onConflict: 'user_id,data_hash' });
+
+        res.json(output);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// SIMULATOR STATE (RESUME FLOW)
+app.get("/api/simulator/state", authenticateUser, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const { data, error } = await supabase
+            .from("simulator_state")
+            .select("state_data")
+            .eq("user_id", userId)
+            .single();
+        
+        if (error && error.code !== "PGRST116") {
+            logger.error("simulator_state_fetch_error", { error, user_id: userId });
+            throw error;
+        }
+
+        logger.info("simulator_state_fetch_success", { 
+            user_id: userId, 
+            has_state: !!data?.state_data,
+            phase: data?.state_data?.phase 
+        });
+
+        res.json(data?.state_data || null);
+    } catch (err) {
+        logger.error("simulator_state_fetch_exception", err);
+        res.status(500).json({ error: "Failed to fetch simulator state" });
+    }
+});
+
+app.post("/api/simulator/state", authenticateUser, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const state = req.body;
+        
+        logger.info("simulator_state_save_request", { 
+            user_id: userId, 
+            phase: state?.phase,
+            questions_count: state?.questions?.length 
+        });
+
+        const { error } = await supabase
+            .from("simulator_state")
+            .upsert({
+                user_id: userId,
+                state_data: state,
+                updated_at: new Date().toISOString()
+            }, { onConflict: 'user_id' });
+        
+        if (error) {
+            logger.error("simulator_state_upsert_error", { error, user_id: userId });
+            throw error;
+        }
+
+        res.json({ success: true });
+    } catch (err) {
+        logger.error("simulator_state_save_exception", err);
+        res.status(500).json({ error: "Failed to save simulator state" });
+    }
+});
+
+// SIMULATOR QUESTION RATING
+app.get("/api/simulator/eligibility", authenticateUser, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const { data, error } = await supabase
+            .from("simulator_state")
+            .select("state_data")
+            .eq("user_id", userId)
+            .single();
+
+        if (error && error.code !== "PGRST116") {
+            throw error;
+        }
+
+        const lastGen = data?.state_data?.lastGeneratedAt || 0;
+        const now = Date.now();
+        const weekInMs = 7 * 24 * 3600 * 1000;
+        
+        if (now - lastGen < weekInMs) {
+            const nextAvailable = new Date(lastGen + weekInMs).toISOString();
+            const remainingDays = Math.ceil((weekInMs - (now - lastGen)) / (24 * 3600 * 1000));
+            return res.json({ eligible: false, nextAvailableAt: nextAvailable, remainingDays });
+        }
+
+        res.json({ eligible: true });
+    } catch (err) {
+        logger.error("simulator_eligibility_error", err);
+        res.status(500).json({ error: "Failed to check eligibility" });
+    }
+});
+
+app.post("/api/simulator/rate", authenticateUser, async (req, res) => {
+    try {
+        const { question, rating } = req.body;
+        const { error } = await supabase.from("simulator_ratings").insert({
+            user_id: req.user.id,
+            question_text: question,
+            rating: rating, // 1 for like, -1 for dislike
+            created_at: new Date().toISOString()
+        });
+        if (error) throw error;
+        res.json({ success: true });
+    } catch (err) {
+        logger.error("simulator_rating_error", err);
+        res.status(500).json({ error: "Failed to save rating" });
+    }
+});
+
+app.post("/api/simulator/recommend", authenticateUser, async (req, res) => {
+    try {
+        const { qna } = req.body; // array of { question, answer }
+        const qnaStr = qna.map(q => `Q: ${q.question} A: ${q.answer}`).join("\n");
+        const prompt = `You are a sharp, no-nonsense Indian financial coach.
+
+User financial profile:
+- Net worth: ${metrics?.netWorth}
+- Savings rate: ${metrics?.savingsRate}%
+- Risk appetite: ${data?.riskAppetite}
+
+User responses:
+${qnaStr}
+
+Context (VERY IMPORTANT):
+Factor in real Indian financial behavior:
+- Family dependency (parents, spouse, future kids)
+- Lifestyle inflation (rent, EMIs, weddings, festivals)
+- Preference for gold, real estate, fixed deposits
+- Lack of insurance and emergency funds
+- Job uncertainty and irregular income growth
+
+Task:
+Recommend EXACTLY 3 highly personalized financial paths for the next 12 weeks.
+
+Each recommendation MUST:
+- Be specific to the user's situation (DO NOT give generic advice)
+- Target a clear behavioral or financial gap from their answers
+- Be practical and realistically achievable in India
+- Push meaningful change (not cosmetic improvements)
+
+STRICT RULES:
+- Each path must feel like a commitment, not a suggestion
+- Avoid generic advice like "save more", "invest wisely"
+- Numbers must feel realistic based on income/savings rate
+- Keep language simple, direct, and actionable
+- No fluff, no motivational talk
+
+Each recommendation MUST include:
+
+1. Title (short, punchy)
+2. Description (clear explanation of what to do and why)
+3. Success Target (numeric, realistic — ₹ based if applicable)
+4. Vision in format:
+   "Current: [painful/weak state] -> Future: [strong/improved state]"
+5. Exactly 3 Action Items:
+   - Each must be a concrete step (not vague)
+   - Each must include an "impact" score (1–10)
+6. Exactly 3 Impact Bullets:
+   - Real-life benefits (stress reduction, stability, flexibility, etc.)
+   - Must feel tangible, not generic
+7. Difficulty: Easy | Medium | Hard (based on behavior change required)
+8. duration_weeks: 12
+9. target_amount: realistic number based on user profile
+
+IMPORTANT:
+- Prioritize in this order if relevant:
+  1. Emergency fund
+  2. Insurance (term + health)
+  3. Cashflow discipline
+  4. SIP / investing consistency
+  5. Debt reduction
+- If user already strong in one area, DO NOT repeat it
+
+Return ONLY JSON:
+{ 
+  "recommendations": [{ 
+    "title": "Short title", 
+    "description": "Detailed actionable steps", 
+    "vision": "Current: X -> Future: Y",
+    "impact_bullets": ["A", "B", "C"],
+    "difficulty": "Hard|Medium|Easy", 
+    "duration_weeks": 12,
+    "target_amount": 5000, 
+    "action_items": [
+      { "text": "...", "impact": 10 }
+    ]
+  }] 
+}`;
+        const output = await callGemini(prompt);
+        res.json(output);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// 4. ACTION TRACKING
+app.post("/api/simulator/track", authenticateUser, async (req, res) => {
+    try {
+        const { action_text, action_items, target_amount } = req.body;
+        logger.info("simulator_track_request", { 
+            user_id: req.user.id, 
+            body: req.body,
+            has_text: !!action_text,
+            items_count: action_items?.length 
+        });
+
+        const { error } = await supabase.from("action_tracking").insert({
+            user_id: req.user.id, 
+            action_text, 
+            action_items, // Stored as JSONB
+            target_amount,
+            progress: 0, 
+            status: 'in_progress', 
+            start_date: new Date().toISOString()
+        });
+        if (error) throw error;
+        res.json({ success: true });
+    } catch (err) {
+        logger.error("simulator_track_error", err, { user_id: req.user.id });
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get("/api/simulator/track", authenticateUser, async (req, res) => {
+    try {
+        const { data, error } = await supabase.from("action_tracking").select("*").eq("user_id", req.user.id).order("start_date", { ascending: false });
+        if (error) throw error;
+        res.json(data);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.put("/api/simulator/track/:id", authenticateUser, async (req, res) => {
+    try {
+        const { progress, status, action_items } = req.body;
+        const payload = { last_update: new Date().toISOString() };
+        if (progress !== undefined) payload.progress = progress;
+        if (status !== undefined) payload.status = status;
+        if (action_items !== undefined) payload.action_items = action_items;
+
+        const { error } = await supabase.from("action_tracking")
+            .update(payload)
+            .eq("id", req.params.id)
+            .eq("user_id", req.user.id);
+        if (error) throw error;
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get("/health", (_req, res) => res.json({ status: "ok" }));
 
 app.listen(PORT, () => {
-    console.log(`\n🚀 WealthPilot backend running on http://localhost:${PORT}`);
-    console.log(`   API key: ${LLM_KEY.slice(0, 8)}${"*".repeat(LLM_KEY.length - 8)} (Gemini)`);
-    console.log(`   POST http://localhost:${PORT}/api/insights\n`);
+    logger.info("server_listening", { port: PORT });
 });
