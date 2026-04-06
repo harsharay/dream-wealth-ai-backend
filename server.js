@@ -461,7 +461,7 @@ app.post("/api/simulator/rate", authenticateUser, async (req, res) => {
 
 app.post("/api/simulator/recommend", authenticateUser, async (req, res) => {
     try {
-        const { qna } = req.body; // array of { question, answer }
+        const { qna, metrics, data } = req.body; // array of { question, answer }
         const qnaStr = qna.map(q => `Q: ${q.question} A: ${q.answer}`).join("\n");
         const prompt = `You are a sharp, no-nonsense Indian financial coach.
 
