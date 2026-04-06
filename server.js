@@ -242,7 +242,7 @@ Return ONLY a valid JSON object matching exactly:
   "sections": [
     { "title": "Diagnosis", "emoji": "🩺", "bullet": "→", "bgColor": "bg-accent/20", "items": ["<2-3 direct sentences>"] },
     { "title": "Key Risks", "emoji": "⚠️", "bullet": "✕", "bgColor": "bg-danger/10", "items": ["<1-4 risks>"] },
-    { "title": "Action Plan", "emoji": "🎯", "bullet": "→", "bgColor": "bg-accent/10", "items": ["<2-3 actions>"] }
+    { "title": "Action Plan", "emoji": "🎯", "bullet": "→", "bgColor": "bg-primary/20", "items": ["<2-3 actions>"] }
   ],
   "warnings": ["<0-3 short punchy warnings>"]
 }`;
