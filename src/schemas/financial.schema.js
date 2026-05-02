@@ -7,6 +7,21 @@ export const financialDataSchema = z
         assets: z.record(z.number().min(0)),
         liabilities: z.record(z.number().min(0)),
         riskAppetite: z.enum(["low", "medium", "high"]),
+        ageRange: z
+            .enum([
+                "under_20",
+                "20_25",
+                "26_30",
+                "31_35",
+                "36_40",
+                "41_45",
+                "46_50",
+                "51_55",
+                "56_60",
+                "above_60",
+            ])
+            .optional(),
+        targetRetirementCorpus: z.number().min(0).max(100000000000).optional(),
     })
     .strict();
 

@@ -2,11 +2,13 @@ import { supabase } from "../config/supabase.js";
 import { logger } from "../utils/logger.js";
 import { encryptData, decryptData } from "../utils/crypto.js";
 import { financialDataSchema } from "../schemas/financial.schema.js";
+import { buildFinancialMetricsPayload } from "../utils/financialMetrics.js";
 
 export const saveFinancialRecords = async (req, res) => {
     try {
         const validatedArgs = financialDataSchema.parse(req.body);
         const encryptedPayload = encryptData(validatedArgs);
+        const metrics = buildFinancialMetricsPayload(validatedArgs);
 
         const { error } = await supabase.from("financial_records").upsert(
             {
@@ -19,7 +21,7 @@ export const saveFinancialRecords = async (req, res) => {
 
         if (error) throw error;
         logger.info("financial_records_saved", { user_id: req.user.id });
-        res.json({ success: true });
+        res.json({ success: true, metrics });
     } catch (err) {
         logger.error("financial_records_error", err, { user_id: req.user.id });
         res.status(400).json({ error: err.issues || err.message });
@@ -40,7 +42,8 @@ export const getFinancialRecords = async (req, res) => {
         if (!data) return res.json(null);
 
         const decrypted = decryptData(data.encrypted_payload);
-        res.json(decrypted);
+        const metrics = buildFinancialMetricsPayload(decrypted);
+        res.json({ data: decrypted, metrics });
     } catch (err) {
         logger.error("financial_records_fetch_error", err, { user_id: req.user.id });
         res.status(500).json({ error: "Failed to retrieve financial records" });
